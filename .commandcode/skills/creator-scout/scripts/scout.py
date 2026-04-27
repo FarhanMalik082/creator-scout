@@ -1,13 +1,13 @@
 """creator-scout — content-based discovery for dev-focused YouTube channels.
 
-Runs in 3 stages. LLM work (topic extraction, niche scoring) happens in
+Runs in stages. LLM work (topic extraction, niche scoring) happens in
 CommandCode between stages. This script does all the non-LLM plumbing:
 pulling video titles, searching YouTube, enriching channels, scoring,
 writing CSV.
 
 Usage:
     python scout.py stage1 --output seeds.json
-    python scout.py stage2 --topics topics.json --output candidates_raw.json
+    python scout.py stage2 --topics topics.json --seeds-data seeds.json --output candidates_raw.json
     python scout.py stage3 --raw candidates_raw.json --scores scores.json \\
         --output-json final.json --output-csv final.csv
 """
@@ -46,12 +46,10 @@ def normalize_handle(handle: str) -> str:
 
 
 def safe_sleep(seconds: float) -> None:
-    """Rate limiter wrapper so we can swap in jitter later if needed."""
     time.sleep(seconds)
 
 
 def ytdlp_extract(url: str, opts_overrides: Optional[dict] = None) -> Optional[dict]:
-    """Thin wrapper with consistent defaults and error logging."""
     opts = {
         "quiet": True,
         "skip_download": True,
@@ -87,7 +85,6 @@ def stage1_analyze_seed(handle: str, video_limit: int) -> SeedAnalysis:
 
     analysis = SeedAnalysis(handle=handle)
 
-    # Pull videos (flat list — no description, we only need titles)
     videos_url = f"https://www.youtube.com/{handle}/videos"
     info = ytdlp_extract(videos_url, {
         "extract_flat": True,
@@ -98,7 +95,6 @@ def stage1_analyze_seed(handle: str, video_limit: int) -> SeedAnalysis:
         analysis.error = "channel not accessible"
         return analysis
 
-    # Channel metadata from the videos-list response
     analysis.channel_id = info.get("channel_id") or info.get("id")
     analysis.channel_name = info.get("channel") or info.get("uploader") or info.get("title")
     analysis.sub_count = info.get("channel_follower_count")
@@ -115,7 +111,6 @@ def stage1_analyze_seed(handle: str, video_limit: int) -> SeedAnalysis:
 
 
 def cmd_stage1(args) -> int:
-    # Load seeds config
     try:
         with open(SEEDS_FILE, "r", encoding="utf-8") as f:
             seeds_config = json.load(f)
@@ -155,8 +150,8 @@ def cmd_stage1(args) -> int:
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
     print(f"\nWrote {args.output}", file=sys.stderr)
-    print(f"\n>> NEXT: read this file, extract 10-15 topics, "
-          f"write to /tmp/creator_scout_topics.json, then run stage2.",
+    print(f"\n>> NEXT: read this file, extract 10-15 SPECIFIC topics, "
+          f"write to /tmp/creator_scout_topics.json, get user approval, then run stage2.",
           file=sys.stderr)
     return 0
 
@@ -179,7 +174,6 @@ class Candidate:
 
 
 def stage2_search_topic(topic: str, per_search: int) -> list[dict]:
-    """Search YouTube for a topic. Return unique uploader channels from results."""
     query = f"ytsearch{per_search}:{topic}"
     info = ytdlp_extract(query, {"extract_flat": True})
     if not info:
@@ -203,7 +197,6 @@ def stage2_search_topic(topic: str, per_search: int) -> list[dict]:
 
 
 def stage2_enrich_channel(cid: str, sample_title_count: int) -> dict:
-    """Pull sub count and a few recent video titles for a candidate channel."""
     url = f"https://www.youtube.com/channel/{cid}/videos"
     info = ytdlp_extract(url, {
         "extract_flat": True,
@@ -215,9 +208,6 @@ def stage2_enrich_channel(cid: str, sample_title_count: int) -> dict:
     entries = (info.get("entries") or [])[:sample_title_count]
     titles = [e.get("title", "").strip() for e in entries if e.get("title")]
 
-    # Try to figure out last upload recency (rough — extract_flat doesn't give dates reliably)
-    # We leave this None for v0.1 and let the LLM stage use titles only.
-
     return {
         "channel_name": info.get("channel") or info.get("uploader") or info.get("title"),
         "sub_count": info.get("channel_follower_count"),
@@ -226,7 +216,6 @@ def stage2_enrich_channel(cid: str, sample_title_count: int) -> dict:
 
 
 def cmd_stage2(args) -> int:
-    # Load topics
     with open(args.topics, "r", encoding="utf-8") as f:
         topics_data = json.load(f)
     topics = topics_data.get("topics", [])
@@ -234,22 +223,30 @@ def cmd_stage2(args) -> int:
         print("No topics in topics file. Stage 2a must run first.", file=sys.stderr)
         return 1
 
-    # Also load seed IDs so we can exclude them from candidates
+    # Load seed IDs to exclude — REQUIRED, not optional
     seed_channel_ids: set[str] = set()
-    try:
-        with open(args.seeds_data, "r", encoding="utf-8") as f:
-            seeds_data = json.load(f)
-        for s in seeds_data.get("seeds", []):
-            if s.get("channel_id"):
-                seed_channel_ids.add(s["channel_id"])
-    except FileNotFoundError:
-        print(f"  (warning: {args.seeds_data} not found, can't exclude seeds)",
+    if args.seeds_data:
+        try:
+            with open(args.seeds_data, "r", encoding="utf-8") as f:
+                seeds_data = json.load(f)
+            for s in seeds_data.get("seeds", []):
+                if s.get("channel_id"):
+                    seed_channel_ids.add(s["channel_id"])
+            print(f"Loaded {len(seed_channel_ids)} seed channel IDs to exclude", file=sys.stderr)
+        except FileNotFoundError:
+            print(f"ERROR: --seeds-data file not found: {args.seeds_data}",
+                  file=sys.stderr)
+            print("Without seed exclusion, seeds will appear as their own candidates "
+                  "and contaminate results. Aborting.", file=sys.stderr)
+            return 2
+    else:
+        print("ERROR: --seeds-data is required to dedupe seeds from candidates.",
               file=sys.stderr)
+        return 2
 
-    print(f"Stage 2: searching {len(topics)} topics "
+    print(f"\nStage 2: searching {len(topics)} topics "
           f"({args.per_search} results per topic)...", file=sys.stderr)
 
-    # Candidates keyed by channel_id; accumulate topic matches
     candidates: dict[str, Candidate] = {}
 
     for i, topic in enumerate(topics, 1):
@@ -271,9 +268,16 @@ def cmd_stage2(args) -> int:
                 c.topic_overlap += 1
         safe_sleep(0.4)
 
-    print(f"\n  found {len(candidates)} unique candidate channels", file=sys.stderr)
+    # Verification: no seeds in candidates
+    contaminated = [cid for cid in candidates if cid in seed_channel_ids]
+    if contaminated:
+        print(f"ERROR: {len(contaminated)} seed channel(s) ended up in candidates: "
+              f"{contaminated}. This shouldn't happen.", file=sys.stderr)
+        return 2
 
-    # Cap at max_candidates by overlap before enriching (enrichment is slow)
+    print(f"\n  found {len(candidates)} unique candidate channels "
+          f"(after seed exclusion)", file=sys.stderr)
+
     sorted_candidates = sorted(
         candidates.values(),
         key=lambda c: -c.topic_overlap,
@@ -295,13 +299,14 @@ def cmd_stage2(args) -> int:
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "topics_searched": topics,
+        "seed_channels_excluded": list(seed_channel_ids),
         "candidates": [asdict(c) for c in sorted_candidates],
     }
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
     print(f"\nWrote {args.output}", file=sys.stderr)
     print(f"\n>> NEXT: read this file, score each candidate's niche relevance (0-100), "
-          f"write to /tmp/creator_scout_scores.json, then run stage3.",
+          f"write UNIQUE channel_ids only to /tmp/creator_scout_scores.json, then run stage3.",
           file=sys.stderr)
     return 0
 
@@ -315,20 +320,18 @@ def final_score(niche_score: int, sub_count: Optional[int], topic_overlap: int,
     """Combine LLM niche score with structural signals.
 
     Weights:
-    - niche relevance (LLM): 60%  — the whole point
-    - topic overlap:        25%  — breadth of match
-    - size (log scaled):    15%  — bigger = wider reach but not overwhelming
+    - niche relevance (LLM): 60%
+    - topic overlap:        25%
+    - size (log scaled):    15%
     """
     niche_component = (niche_score / 100) * 60
-
     overlap_component = (topic_overlap / max(max_overlap, 1)) * 25
 
     if sub_count:
-        # log-ish scaling: 1k=~3, 10k=~6, 100k=~9, 1M=~12, 10M=~15
         import math
         size_component = min(15, max(0, (math.log10(sub_count) - 2) * 3))
     else:
-        size_component = 5  # unknown = neutral
+        size_component = 5
 
     return round(niche_component + overlap_component + size_component, 2)
 
@@ -340,8 +343,36 @@ def cmd_stage3(args) -> int:
         scores_data = json.load(f)
 
     raw_candidates = raw_data["candidates"]
-    score_map = {s["channel_id"]: s for s in scores_data.get("scores", [])}
+    raw_ids = {c["channel_id"] for c in raw_candidates}
+    scores_list = scores_data.get("scores", [])
 
+    # Validation 1: check for duplicate channel_ids in scores
+    from collections import Counter
+    score_id_counts = Counter(s["channel_id"] for s in scores_list)
+    duplicates = {k: v for k, v in score_id_counts.items() if v > 1}
+    if duplicates:
+        print(f"ERROR: scores file has {len(duplicates)} duplicate channel_ids:",
+              file=sys.stderr)
+        for cid, count in list(duplicates.items())[:5]:
+            print(f"  {cid} appears {count}x", file=sys.stderr)
+        print("Stage 3a must produce unique channel_ids only. Re-score and try again.",
+              file=sys.stderr)
+        return 2
+
+    score_map = {s["channel_id"]: s for s in scores_list}
+
+    # Validation 2: check for hallucinated channel_ids (in scores but not in raw)
+    hallucinated = set(score_map.keys()) - raw_ids
+    if hallucinated:
+        print(f"ERROR: {len(hallucinated)} channel_ids in scores don't exist in raw candidates:",
+              file=sys.stderr)
+        for cid in list(hallucinated)[:5]:
+            print(f"  {cid}", file=sys.stderr)
+        print("Stage 3a must use exact channel_ids from the raw file. Re-score.",
+              file=sys.stderr)
+        return 2
+
+    # Validation 3: every candidate must have a score
     missing = [c["channel_id"] for c in raw_candidates if c["channel_id"] not in score_map]
     if missing:
         print(f"ERROR: {len(missing)} candidates have no score. "
@@ -372,7 +403,6 @@ def cmd_stage3(args) -> int:
 
     ranked.sort(key=lambda r: -r["final_score"])
 
-    # JSON
     with open(args.output_json, "w", encoding="utf-8") as f:
         json.dump({
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -381,7 +411,6 @@ def cmd_stage3(args) -> int:
             "candidates": ranked,
         }, f, indent=2, ensure_ascii=False)
 
-    # CSV
     with open(args.output_csv, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow([
@@ -427,8 +456,8 @@ def main() -> int:
 
     p2 = sub.add_parser("stage2", help="Search YouTube for topics, collect candidates")
     p2.add_argument("--topics", required=True, help="Path to topics JSON from stage2a")
-    p2.add_argument("--seeds-data", default="/tmp/creator_scout_seeds.json",
-                    help="Path to stage1 output (to exclude seeds from candidates)")
+    p2.add_argument("--seeds-data", required=True,
+                    help="Path to stage1 output (REQUIRED to exclude seeds from candidates)")
     p2.add_argument("--per-search", type=int, default=20,
                     help="Max results per YouTube search")
     p2.add_argument("--max-candidates", type=int, default=80,
