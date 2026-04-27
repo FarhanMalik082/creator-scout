@@ -1,8 +1,10 @@
 # creator-scout
 
-A [Command Code](https://commandcode.ai) skill that discovers dev-focused YouTube creators worth pitching for a dev tool brand. Runs in ~15 minutes for under $0.25 in tokens on the $1 Go plan.
+A [Command Code](https://commandcode.ai) skill that discovers dev-focused YouTube creators worth pitching for a dev tool brand. Runs in ~10 minutes for under $0.35 in tokens on the $1 Go plan.
 
 Built as part of the Command Code growth team's outreach workflow. Replaces the parts of $300/mo influencer research SaaS tools that matter for B2B dev tool marketing.
+
+**Current version: v0.2** — adds human-in-the-loop topic review and stricter validation between stages.
 
 ## What it does
 
@@ -11,12 +13,19 @@ You give it 5–10 seed creators you already consider good sponsor fits. It retu
 The pipeline:
 
 1. **Pull seed titles** — fetches recent video titles from each seed channel
-2. **Extract topics** — Command Code reads the titles and identifies 10–15 specific searchable topics
-3. **Search YouTube** — finds channels whose recent videos cover those same topics
-4. **Score candidates** — Command Code scores each candidate's niche fit 0–100 based on its recent titles
-5. **Rank** — combines the niche score with topic overlap and channel size into a final ranked CSV
+2. **Extract topics** — Command Code reads the titles and proposes 10–15 specific searchable topics
+3. **Review topics (human-in-the-loop)** — Command Code shows you the topics and waits for your approval before continuing
+4. **Search YouTube** — finds channels whose recent videos cover those approved topics
+5. **Score candidates** — Command Code scores each candidate's niche fit 0–100 based on its recent titles
+6. **Rank** — combines the niche score with topic overlap and channel size into a final ranked CSV
 
-Stages 2 and 4 use Command Code's open-source models (Kimi K2.6 by default). Everything else is plain Python with `yt-dlp`.
+Stages 2 and 5 use Command Code's open-source models (Kimi K2.6 by default). Everything else is plain Python with `yt-dlp`.
+
+### Why the topic review matters
+
+LLM topic extraction is non-deterministic. The same seeds can produce specific topics on one run ("python dependency injection", "neovim configuration") and generic topics on another ("python tutorial", "react nextjs tutorial"). Generic topics dominate the YouTube search results and crowd out the niche channels you actually want to find.
+
+The topic-review checkpoint takes ~10 seconds of your attention and prevents 7 minutes of bad downstream work. If the topics look generic, you can paste a corrected list inline and the pipeline uses your version.
 
 ## Sample output
 
@@ -55,8 +64,10 @@ The skill folder lives at `.commandcode/skills/creator-scout/`. To use it from a
    ```
    run creator-scout
    ```
+4. **When it shows you the extracted topics, review them.** Type `continue` to proceed with the topics as-is, or paste a corrected JSON to override.
+5. Wait ~7–10 minutes for Stages 4–6 to finish. Top 10 prints to terminal; full results are in the CSV.
 
-The skill orchestrates all 5 stages. Total runtime is ~15 minutes for 8 seeds and 80 candidates.
+Total runtime is ~10 minutes for 8 seeds and 80 candidates.
 
 ## seeds.json format
 
@@ -81,6 +92,7 @@ python .commandcode/skills/creator-scout/scripts/scout.py stage1 \
   --per-seed 30 --output seeds_data.json
 
 # Stage 2 only — search candidates from a topics file
+# Note: --seeds-data is REQUIRED so seed channels are excluded from candidates
 python .commandcode/skills/creator-scout/scripts/scout.py stage2 \
   --topics topics.json --seeds-data seeds_data.json \
   --per-search 20 --max-candidates 80 --output candidates.json
@@ -91,18 +103,21 @@ python .commandcode/skills/creator-scout/scripts/scout.py stage3 \
   --output-json final.json --output-csv final.csv
 ```
 
+Stage 3 validates that the scores file contains unique channel IDs and that every score corresponds to a real candidate. It exits with a clear error if either check fails so you can re-score and retry.
+
 ## Limitations
 
-- Topic specificity matters. Vague seeds produce vague topics produce noisy results.
-- YouTube can rate-limit `yt-dlp` searches from cloud IPs. Run locally for best results.
-- The LLM occasionally hallucinates channel IDs at the boundary between stages 2 and 3. The script catches this and exits cleanly so you can re-score.
-- Sub counts come from YouTube's display value and can lag real subscriber counts by hours or days.
+- **Topic specificity matters.** Vague seeds produce vague topics. Even with the human review step, a careful seed list gives you better starting topics to approve.
+- **Cloud IPs get rate-limited.** YouTube blocks `yt-dlp` searches from AWS, GCP, and DigitalOcean addresses pretty aggressively. Run on a residential IP for best results.
+- **Sub counts can lag.** YouTube's display values update on their own schedule. Treat them as approximate.
+- **Run-to-run variance is real but bounded.** With the topic-review step you control the input to Stage 4, which is the largest source of variance. The remaining variance comes from YouTube's search ranking and the LLM's scoring at the margins (a few candidates near score 70 may shift to 65 or 75 between runs).
 
 ## Roadmap
 
-- `--max-subs` flag to filter out tier-1 creators (Fireship, etc.) when running on a smaller budget
+- `--max-subs` flag to filter out tier-1 creators (Fireship, etc.) when running on a smaller budget — most B2B dev tools convert better in the 20k–200k range
 - Sponsor history detection — cross-reference candidates' descriptions against known dev-tool advertiser domains
 - Cache layer so re-runs in the same week don't re-fetch identical data
+- A `topics_pinned.json` option for fully deterministic runs in CI/scheduled contexts
 
 ## License
 
