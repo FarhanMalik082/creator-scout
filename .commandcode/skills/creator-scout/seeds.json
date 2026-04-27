@@ -1,0 +1,15 @@
+{
+  "_comment": "Seed channels for creator-scout discovery. These are known-good dev creators with verified sponsor history. Discovery uses their shared sponsor patterns to find adjacent channels in the same niche.",
+  "brand": "CommandCode",
+  "niche": "dev-tools",
+  "seeds": [
+    {"handle": "@AICodeKing", "notes": "AI coding tools reviewer"},
+    {"handle": "@sethyedw", "notes": "dev tools and AI coding"},
+    {"handle": "@ArjanCodes", "notes": "Python + software engineering"},
+    {"handle": "@EngineeringwithUtsav", "notes": "software engineering, India market"},
+    {"handle": "@FaztCode", "notes": "web dev + programming tutorials (Spanish)"},
+    {"handle": "@AnshLambaJSR", "notes": "dev tutorials, India market"},
+    {"handle": "@beau", "notes": "freeCodeCamp, programming education"},
+    {"handle": "@Bijanbowen", "notes": "AI coding and dev tools"}
+  ]
+}
